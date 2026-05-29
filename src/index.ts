@@ -1,13 +1,13 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process"
+import { dirname, join } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { execFileSync } from "child_process"
-import { dirname, join } from "path"
-import { fileURLToPath } from "url"
 import { z } from "zod"
+import { getTraktCredentials } from "./auth.js"
+import { startHttp, startStdio } from "./transports.js"
 
 if (process.argv[2] === "setup") {
-  const { spawnSync } = await import("child_process")
   const setupScript = join(
     dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -19,84 +19,220 @@ if (process.argv[2] === "setup") {
   process.exit(result.status ?? 0)
 }
 
-const KEYCHAIN_SERVICE = "mcp-trakt"
-
-const keychainRead = (account: string): string | null => {
-  try {
-    return (
-      execFileSync(
-        "security",
-        ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-        { stdio: ["pipe", "pipe", "pipe"] },
-      )
-        .toString()
-        .trim() || null
-    )
-  } catch {
-    return null
-  }
-}
-
-const CLIENT_ID = process.env.MCP_TRAKT_CLIENT_ID || keychainRead("client-id")
-const ACCESS_TOKEN =
-  process.env.MCP_TRAKT_ACCESS_TOKEN || keychainRead("access-token")
-
-if (!CLIENT_ID) {
-  console.error(
-    "Missing client ID — set MCP_TRAKT_CLIENT_ID or run: npx @kud/mcp-trakt setup",
-  )
-  process.exit(1)
-}
-
-if (!ACCESS_TOKEN) {
-  console.error(
-    "Missing access token — set MCP_TRAKT_ACCESS_TOKEN or run: npx @kud/mcp-trakt setup",
-  )
-  process.exit(1)
-}
-
 export const API_BASE = "https://api.trakt.tv"
+const USER_AGENT = "mcp-trakt"
+
+const needsAccessToken = (path: string) =>
+  path.startsWith("/sync") ||
+  path.startsWith("/calendars/my") ||
+  path.startsWith("/checkin") ||
+  path.startsWith("/scrobble") ||
+  path.startsWith("/recommendations") ||
+  /^\/users\/me(?:[/?]|$)/.test(path)
+
+const isTraktDebugEnabled = () =>
+  ["1", "true", "yes"].includes(
+    (process.env.MCP_TRAKT_DEBUG || process.env.TRAKT_DEBUG || "").toLowerCase(),
+  )
+
+const redactHeaderValue = (name: string, value: string) => {
+  if (["authorization", "trakt-api-key"].includes(name.toLowerCase())) {
+    return value ? "[redacted]" : "[missing]"
+  }
+  return value
+}
+
+const headersToObject = (headers: Headers) =>
+  Object.fromEntries(
+    [...headers.entries()].map(([name, value]) => [
+      name,
+      redactHeaderValue(name, value),
+    ]),
+  )
+
+const responseHeadersToObject = (headers: Headers | undefined) =>
+  headers ? Object.fromEntries([...headers.entries()].slice(0, 100)) : {}
+
+const previewBody = (body: string) => body.slice(0, 2_000)
+
+let lastTraktError: string | null = null
+
+const setLastTraktError = (message: string) => {
+  lastTraktError = message
+}
+
+const takeLastTraktError = () => {
+  const message = lastTraktError
+  lastTraktError = null
+  return message
+}
+
+const isCloudflareHtmlResponse = (response: Response, body: string) => {
+  const contentType = response.headers?.get("content-type") || ""
+  return (
+    response.status === 403 &&
+    contentType.toLowerCase().includes("text/html") &&
+    /cloudflare|attention required|you have been blocked|unable to access trakt\.tv/i.test(
+      body,
+    )
+  )
+}
+
+const readResponseBody = async (response: Response) => {
+  const maybeText = response as Response & { text?: () => Promise<string> }
+  if (typeof maybeText.text === "function") return await maybeText.text()
+
+  const maybeJson = response as Response & { json?: () => Promise<unknown> }
+  if (typeof maybeJson.json === "function") {
+    return JSON.stringify(await maybeJson.json())
+  }
+
+  return ""
+}
 
 export const apiFetch = async <T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T | null> => {
+  const requiresAccessToken = needsAccessToken(path)
+  const method = options.method || "GET"
+  const url = `${API_BASE}${path}`
+
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers: {
-        "trakt-api-version": "2",
-        "trakt-api-key": CLIENT_ID!,
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        ...options.headers,
-      },
+    const credentials = await getTraktCredentials({
+      requireAccessToken: requiresAccessToken,
     })
-    if (!response.ok) {
+    if (requiresAccessToken && !credentials.accessToken) {
       console.error(
-        `API error: ${response.status} ${response.statusText} — ${path}`,
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN (or TRAKT_ACCESS_TOKEN).`,
+      )
+      return null
+    }
+
+    const headers = new Headers(options.headers)
+    headers.set("trakt-api-version", "2")
+    headers.set("trakt-api-key", credentials.clientId)
+    headers.set("Content-Type", "application/json")
+    headers.set("User-Agent", USER_AGENT)
+    if (requiresAccessToken && credentials.accessToken) {
+      headers.set("Authorization", `Bearer ${credentials.accessToken}`)
+    }
+
+    if (isTraktDebugEnabled()) {
+      console.error(
+        "Trakt API request:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            headers: headersToObject(headers),
+            timeout: "node-fetch-default",
+            requiresAccessToken,
+            hasAccessToken: Boolean(credentials.accessToken),
+          },
+          null,
+          2,
+        ),
+      )
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      method,
+      headers,
+    })
+
+    if (!response.ok) {
+      const body = await readResponseBody(response).catch(() => "<unavailable>")
+      if (isCloudflareHtmlResponse(response, body)) {
+        setLastTraktError(
+          `Trakt API request blocked by Cloudflare: ${response.status} HTML response`,
+        )
+      }
+      console.error(
+        "Trakt API error:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            status: response.status,
+            statusText: response.statusText,
+            requestHeaders: headersToObject(headers),
+            responseHeaders: responseHeadersToObject(response.headers),
+            body: previewBody(body),
+          },
+          null,
+          2,
+        ),
       )
       return null
     }
     if (response.status === 204) return null
-    return (await response.json()) as T
+
+    const body = await readResponseBody(response)
+    try {
+      return JSON.parse(body) as T
+    } catch (error) {
+      console.error(
+        "Trakt API JSON parse error:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            status: response.status,
+            statusText: response.statusText,
+            responseHeaders: responseHeadersToObject(response.headers),
+            body: previewBody(body),
+            error: error instanceof Error ? error.message : String(error),
+          },
+          null,
+          2,
+        ),
+      )
+      return null
+    }
   } catch (error) {
-    console.error(`Fetch failed: ${path}`, error)
+    console.error(
+      "Trakt API fetch failed:",
+      JSON.stringify(
+        {
+          method,
+          url,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        null,
+        2,
+      ),
+    )
     return null
   }
 }
 
 const apiDelete = async (path: string): Promise<boolean> => {
   try {
+    const credentials = await getTraktCredentials({ requireAccessToken: true })
+    if (!credentials.accessToken) {
+      console.error(
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN (or TRAKT_ACCESS_TOKEN).`,
+      )
+      return false
+    }
     const response = await fetch(`${API_BASE}${path}`, {
       method: "DELETE",
       headers: {
         "trakt-api-version": "2",
-        "trakt-api-key": CLIENT_ID!,
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "trakt-api-key": credentials.clientId,
+        Authorization: `Bearer ${credentials.accessToken}`,
         "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
       },
     })
+    if (!response.ok) {
+      const body = await readResponseBody(response).catch(() => "<unavailable>")
+      console.error(
+        `Trakt API DELETE error: ${response.status} ${response.statusText} — ${path} — ${previewBody(body)}`,
+      )
+    }
     return response.ok
   } catch (error) {
     console.error(`Delete failed: ${path}`, error)
@@ -109,7 +245,9 @@ export const ok = (data: unknown) => ({
 })
 
 export const err = (msg: string) => ({
-  content: [{ type: "text" as const, text: `Error: ${msg}` }],
+  content: [
+    { type: "text" as const, text: `Error: ${takeLastTraktError() || msg}` },
+  ],
 })
 
 const today = () => new Date().toISOString().split("T")[0]!
@@ -763,6 +901,7 @@ export const getUserWatching = async ({ username }: { username: string }) => {
 
 // ─── Server ───
 
+export const createMcpServer = () => {
 const server = new McpServer({ name: "trakt", version: "1.0.0" })
 
 // ─── Search ───
@@ -1718,13 +1857,34 @@ server.registerTool(
   getUserWatching,
 )
 
-const main = async () => {
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
-  console.error("mcp-trakt running")
+return server
 }
 
-main().catch((error) => {
-  console.error("Fatal:", error)
-  process.exit(1)
-})
+const main = async () => {
+  const transport = process.env.MCP_TRANSPORT ?? "stdio"
+  if (transport === "stdio") {
+    await startStdio(createMcpServer())
+    return
+  }
+  if (transport === "http") {
+    await startHttp(createMcpServer, {
+      host: process.env.MCP_HTTP_HOST ?? "127.0.0.1",
+      port: Number(process.env.MCP_HTTP_PORT ?? "3000"),
+      path: process.env.MCP_HTTP_PATH ?? "/mcp",
+      authToken: process.env.MCP_HTTP_AUTH_TOKEN,
+    })
+    return
+  }
+  throw new Error(`Unsupported MCP_TRANSPORT: ${transport}`)
+}
+
+const isEntrypoint = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false
+
+if (isEntrypoint) {
+  main().catch((error) => {
+    console.error("Fatal:", error instanceof Error ? error.message : error)
+    process.exit(1)
+  })
+}

@@ -76,6 +76,37 @@ describe("getTrendingMovies", () => {
     const result = await api.getTrendingMovies({ limit: 10 })
     expect(result.content[0].text).toContain("Error:")
   })
+
+  it("does not send bearer auth to public endpoints", async () => {
+    mockFetch.mockReturnValue(
+      jsonResponse([{ watchers: 100, movie: { title: "Dune" } }]),
+    )
+    await api.getTrendingMovies({ limit: 10 })
+    const [, request] = mockFetch.mock.calls.at(-1)!
+    const headers = new Headers(request.headers)
+    expect(headers.get("authorization")).toBeNull()
+    expect(headers.get("trakt-api-key")).toBe("test-client-id")
+    expect(headers.get("user-agent")).toBe("mcp-trakt")
+  })
+
+  it("surfaces Cloudflare HTML blocks as a specific tool error", async () => {
+    mockFetch.mockReturnValue(
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        headers: new Headers({ "content-type": "text/html" }),
+        text: () =>
+          Promise.resolve(
+            "<html><title>Attention Required! | Cloudflare</title>Sorry, you have been blocked. You are unable to access trakt.tv</html>",
+          ),
+      }),
+    )
+    const result = await api.getTrendingMovies({ limit: 10 })
+    expect(result.content[0].text).toContain(
+      "Trakt API request blocked by Cloudflare: 403 HTML response",
+    )
+  })
 })
 
 describe("getAnticipatedMovies", () => {
