@@ -72,6 +72,61 @@ const throwOAuthError = async (message, response) => {
 const isDeviceCodeFlowError = (error) =>
   error instanceof Error && error.message.includes("Device code request failed")
 
+const isDocker = () => existsSync("/.dockerenv") || process.env.MCP_TRAKT_AUTH_STORE === "file"
+const authStore = process.env.MCP_TRAKT_AUTH_STORE || (isDocker() ? "file" : "keychain")
+const tokenFile = process.env.MCP_TRAKT_TOKEN_FILE || DEFAULT_TOKEN_FILE
+
+const oauthHeaders = (clientId) => ({
+  "Content-Type": "application/json",
+  Accept: "application/json",
+  "trakt-api-version": "2",
+  "trakt-api-key": clientId,
+  "User-Agent": USER_AGENT,
+})
+
+const sensitiveKeyPattern = /client_secret|access_token|refresh_token/i
+
+const redactSecrets = (value) => {
+  if (Array.isArray(value)) return value.map(redactSecrets)
+  if (!value || typeof value !== "object") return value
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      sensitiveKeyPattern.test(key) ? "[redacted]" : redactSecrets(entry),
+    ]),
+  )
+}
+
+const redactSecretText = (body) =>
+  body.replace(
+    /(client_secret|access_token|refresh_token)(["'\s:=]+)([^\s,"'}]+)/gi,
+    "$1$2[redacted]",
+  )
+
+const safeResponseBody = async (response) => {
+  const body = await response.text()
+  if (!body) return "<empty>"
+
+  try {
+    return JSON.stringify(redactSecrets(JSON.parse(body)), null, 2)
+  } catch {
+    return redactSecretText(body).slice(0, 1500)
+  }
+}
+
+const throwOAuthError = async (message, response) => {
+  const body = await safeResponseBody(response)
+  const cfRay = response.headers.get("cf-ray")
+  const extra = cfRay ? `\nCloudflare Ray ID: ${cfRay}` : ""
+  throw new Error(
+    `${message} (${response.status} ${response.statusText})${extra}\nResponse body: ${body}`,
+  )
+}
+
+const isDeviceCodeFlowError = (error) =>
+  error instanceof Error && error.message.includes("Device code request failed")
+
 const keychainRead = (account) => {
   if (authStore !== "keychain") return null
 

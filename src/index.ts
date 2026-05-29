@@ -66,6 +66,13 @@ const readResponseBody = async (response: Response) => {
   return ""
 }
 
+const needsAccessToken = (path: string) =>
+  path.startsWith("/sync") ||
+  path.startsWith("/calendars/my") ||
+  path.startsWith("/checkin") ||
+  path.startsWith("/scrobble") ||
+  path.startsWith("/recommendations")
+
 export const apiFetch = async <T>(
   path: string,
   options: RequestInit = {},
