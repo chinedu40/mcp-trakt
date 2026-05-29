@@ -10,7 +10,7 @@ const API_BASE = "https://api.trakt.tv"
 const TRAKT_WEB_BASE = "https://trakt.tv"
 const DEFAULT_TOKEN_FILE = "/data/trakt-tokens.json"
 const REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
-const USER_AGENT = "mcp-trakt-setup/1.0"
+const USER_AGENT = "mcp-trakt"
 
 const rl = createInterface({ input: process.stdin, output: process.stdout })
 const ask = (q) => new Promise((resolve) => rl.question(q, resolve))

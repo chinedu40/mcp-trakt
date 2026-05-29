@@ -4,6 +4,7 @@ import { dirname } from "node:path"
 
 const KEYCHAIN_SERVICE = "mcp-trakt"
 const API_BASE = "https://api.trakt.tv"
+const USER_AGENT = "mcp-trakt"
 const DEFAULT_TOKEN_FILE = "/data/trakt-tokens.json"
 
 export type TraktCredentials = {
@@ -164,7 +165,13 @@ const refreshCredentials = async (credentials: TraktCredentials) => {
 
   const response = await fetch(`${API_BASE}/oauth/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "trakt-api-version": "2",
+      "trakt-api-key": credentials.clientId,
+      "User-Agent": USER_AGENT,
+    },
     body: JSON.stringify({
       refresh_token: credentials.refreshToken,
       client_id: credentials.clientId,

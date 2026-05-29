@@ -20,6 +20,7 @@ if (process.argv[2] === "setup") {
 }
 
 export const API_BASE = "https://api.trakt.tv"
+export const USER_AGENT = "mcp-trakt"
 
 const needsAccessToken = (path: string) =>
   path.startsWith("/sync") ||
@@ -49,10 +50,33 @@ const headersToObject = (headers: Headers) =>
     ]),
   )
 
-const responseHeadersToObject = (headers: Headers) =>
-  Object.fromEntries([...headers.entries()].slice(0, 100))
+const responseHeadersToObject = (headers: Headers | undefined) =>
+  headers ? Object.fromEntries([...headers.entries()].slice(0, 100)) : {}
 
 const previewBody = (body: string) => body.slice(0, 2_000)
+
+let lastTraktError: string | null = null
+
+const setLastTraktError = (message: string) => {
+  lastTraktError = message
+}
+
+const takeLastTraktError = () => {
+  const message = lastTraktError
+  lastTraktError = null
+  return message
+}
+
+const isCloudflareHtmlResponse = (response: Response, body: string) => {
+  const contentType = response.headers?.get("content-type") || ""
+  return (
+    response.status === 403 &&
+    contentType.toLowerCase().includes("text/html") &&
+    /cloudflare|attention required|you have been blocked|unable to access trakt\.tv/i.test(
+      body,
+    )
+  )
+}
 
 const readResponseBody = async (response: Response) => {
   const maybeText = response as Response & { text?: () => Promise<string> }
@@ -65,13 +89,6 @@ const readResponseBody = async (response: Response) => {
 
   return ""
 }
-
-const needsAccessToken = (path: string) =>
-  path.startsWith("/sync") ||
-  path.startsWith("/calendars/my") ||
-  path.startsWith("/checkin") ||
-  path.startsWith("/scrobble") ||
-  path.startsWith("/recommendations")
 
 export const apiFetch = async <T>(
   path: string,
@@ -96,6 +113,7 @@ export const apiFetch = async <T>(
     headers.set("trakt-api-version", "2")
     headers.set("trakt-api-key", credentials.clientId)
     headers.set("Content-Type", "application/json")
+    headers.set("User-Agent", USER_AGENT)
     if (requiresAccessToken && credentials.accessToken) {
       headers.set("Authorization", `Bearer ${credentials.accessToken}`)
     }
@@ -126,6 +144,11 @@ export const apiFetch = async <T>(
 
     if (!response.ok) {
       const body = await readResponseBody(response).catch(() => "<unavailable>")
+      if (isCloudflareHtmlResponse(response, body)) {
+        setLastTraktError(
+          `Trakt API request blocked by Cloudflare: ${response.status} HTML response`,
+        )
+      }
       console.error(
         "Trakt API error:",
         JSON.stringify(
@@ -201,6 +224,7 @@ const apiDelete = async (path: string): Promise<boolean> => {
         "trakt-api-key": credentials.clientId,
         Authorization: `Bearer ${credentials.accessToken}`,
         "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
       },
     })
     if (!response.ok) {
@@ -221,7 +245,9 @@ export const ok = (data: unknown) => ({
 })
 
 export const err = (msg: string) => ({
-  content: [{ type: "text" as const, text: `Error: ${msg}` }],
+  content: [
+    { type: "text" as const, text: `Error: ${takeLastTraktError() || msg}` },
+  ],
 })
 
 const today = () => new Date().toISOString().split("T")[0]!

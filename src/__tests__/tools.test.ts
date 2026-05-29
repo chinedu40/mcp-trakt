@@ -86,6 +86,26 @@ describe("getTrendingMovies", () => {
     const headers = new Headers(request.headers)
     expect(headers.get("authorization")).toBeNull()
     expect(headers.get("trakt-api-key")).toBe("test-client-id")
+    expect(headers.get("user-agent")).toBe("mcp-trakt")
+  })
+
+  it("surfaces Cloudflare HTML blocks as a specific tool error", async () => {
+    mockFetch.mockReturnValue(
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        headers: new Headers({ "content-type": "text/html" }),
+        text: () =>
+          Promise.resolve(
+            "<html><title>Attention Required! | Cloudflare</title>Sorry, you have been blocked. You are unable to access trakt.tv</html>",
+          ),
+      }),
+    )
+    const result = await api.getTrendingMovies({ limit: 10 })
+    expect(result.content[0].text).toContain(
+      "Trakt API request blocked by Cloudflare: 403 HTML response",
+    )
   })
 })
 
