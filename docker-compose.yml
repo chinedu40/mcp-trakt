@@ -1,0 +1,25 @@
+services:
+  mcp-trakt:
+    build: .
+    container_name: mcp-trakt
+    restart: unless-stopped
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: 3000
+      MCP_HTTP_PATH: /mcp
+      MCP_TRAKT_AUTH_STORE: file
+      MCP_TRAKT_TOKEN_FILE: /data/trakt-tokens.json
+      MCP_TRAKT_CLIENT_ID: ${MCP_TRAKT_CLIENT_ID:-}
+      MCP_TRAKT_CLIENT_SECRET: ${MCP_TRAKT_CLIENT_SECRET:-}
+      MCP_TRAKT_ACCESS_TOKEN: ${MCP_TRAKT_ACCESS_TOKEN:-}
+      MCP_TRAKT_REFRESH_TOKEN: ${MCP_TRAKT_REFRESH_TOKEN:-}
+      MCP_TRAKT_TOKEN_EXPIRES_AT: ${MCP_TRAKT_TOKEN_EXPIRES_AT:-}
+      MCP_HTTP_AUTH_TOKEN: ${MCP_HTTP_AUTH_TOKEN:-}
+    volumes:
+      - mcp-trakt-data:/data
+    ports:
+      - "3000:3000"
+
+volumes:
+  mcp-trakt-data:

@@ -69,6 +69,175 @@ No credentials needed in the config — the server reads them from macOS Keychai
 
 ---
 
+## Docker / Remote MCP deployment
+
+The default `npx @kud/mcp-trakt` path still uses stdio for local MCP clients. Docker deployments can switch to Streamable HTTP with `MCP_TRANSPORT=http` and file-backed Trakt credentials so the container does not need macOS Keychain.
+
+### 1. Prepare the environment
+
+```bash
+git clone https://github.com/<your-username>/mcp-trakt.git
+cd mcp-trakt
+cp .env.example .env
+```
+
+Edit `.env` and set at least:
+
+```bash
+MCP_TRAKT_CLIENT_ID=your-trakt-client-id
+MCP_TRAKT_CLIENT_SECRET=your-trakt-client-secret
+MCP_HTTP_AUTH_TOKEN=use-a-long-random-token
+```
+
+Keep `.env` private. It is ignored by git.
+
+### 2. First-time Trakt authorization
+
+Run the setup command in the same container environment that will store tokens:
+
+```bash
+docker compose run --rm mcp-trakt npm run setup
+```
+
+The setup command uses Trakt's device-code OAuth flow by default, prints a verification URL and user code, and writes tokens to `/data/trakt-tokens.json`. If Trakt rejects the device-code request, setup automatically falls back to a standard authorization-code flow: it prints an authorize URL, asks you to paste the returned code, exchanges it for tokens, and writes the same token file. That path is backed by the `mcp-trakt-data` Docker volume. The token file format is:
+
+```json
+{
+  "client_id": "xxx",
+  "client_secret": "xxx",
+  "access_token": "xxx",
+  "refresh_token": "xxx",
+  "expires_at": 1790000000000
+}
+```
+
+You can override the location with `MCP_TRAKT_TOKEN_FILE`. If an access token expires and a refresh token plus client secret are available, the server refreshes the token automatically and writes the refreshed token back to the configured token file (or `/data/trakt-tokens.json` when `/data` exists).
+
+### 3. Start the HTTP MCP server
+
+```bash
+docker compose up -d --build
+```
+
+The Compose service exposes:
+
+- Health check: `GET http://localhost:3000/health`
+- Streamable HTTP MCP endpoint: `http://localhost:3000/mcp`
+
+Test the health endpoint:
+
+```bash
+curl -i http://localhost:3000/health
+```
+
+If `MCP_HTTP_AUTH_TOKEN` is set, remote MCP clients must send:
+
+```http
+Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>
+```
+
+The health endpoint intentionally does not expose token values or detailed auth status.
+
+### 4. Reverse proxy and HTTPS
+
+For production, put the container behind a reverse proxy, terminate HTTPS there, and bind the Compose port only where appropriate for your host firewall. Do not expose the raw HTTP endpoint to the public internet without either `MCP_HTTP_AUTH_TOKEN` or an OAuth/OIDC-capable gateway.
+
+Minimal nginx location example:
+
+```nginx
+location /mcp {
+  proxy_pass http://127.0.0.1:3000/mcp;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header Authorization $http_authorization;
+}
+
+location /health {
+  proxy_pass http://127.0.0.1:3000/health;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+}
+```
+
+Security checklist:
+
+- Use HTTPS for any remote deployment.
+- Set a long random `MCP_HTTP_AUTH_TOKEN`, or protect the service with an OAuth/OIDC gateway such as Authentik, Authelia, Cloudflare Access, or another reverse proxy that can enforce OAuth.
+- Keep `.env` and `/data/trakt-tokens.json` private.
+- Rotate Trakt credentials and tokens if they are leaked.
+- Do not paste access or refresh tokens into logs or issue reports.
+
+### 5. Useful Docker commands
+
+```bash
+docker compose logs --tail=100 mcp-trakt
+docker compose exec mcp-trakt node dist/index.js setup
+docker compose down
+```
+
+## Remote MCP clients
+
+### Claude Desktop / Claude remote connectors
+
+Claude Desktop has historically focused on local stdio MCP servers. If your Claude app or plan supports remote MCP connectors directly, configure the remote URL as:
+
+```text
+https://your-domain.example.com/mcp
+```
+
+and send this authorization header if you configured `MCP_HTTP_AUTH_TOKEN`:
+
+```text
+Authorization: Bearer YOUR_TOKEN
+```
+
+If your Claude Desktop build does not support direct remote HTTP MCP servers, use a local stdio-to-HTTP bridge. One common pattern is `mcp-remote`; verify the current package options before relying on this exact shape:
+
+```json
+{
+  "mcpServers": {
+    "trakt": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://your-domain.example.com/mcp",
+        "--header",
+        "Authorization: Bearer YOUR_TOKEN"
+      ]
+    }
+  }
+}
+```
+
+### ChatGPT custom connectors
+
+Use the remote MCP URL:
+
+```text
+https://your-domain.example.com/mcp
+```
+
+ChatGPT custom connector availability depends on your plan/workspace and current OpenAI feature access. If ChatGPT requires OAuth for custom connectors, this project's simple bearer-token gate is not a complete OAuth provider. For production, place this service behind an OAuth/OIDC-capable gateway and expose only HTTPS.
+
+### MCP Inspector
+
+After building locally, you can inspect the stdio server with:
+
+```bash
+npm run inspect
+```
+
+For the Docker HTTP endpoint, start the service and run:
+
+```bash
+npm run inspect:http
+```
+
+If bearer auth is enabled, configure the Inspector request headers with `Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>`.
+
+---
+
 ## Installation
 
 Run `npx @kud/mcp-trakt@latest setup` first — this saves your credentials to macOS Keychain so no tokens are needed in any config file.
@@ -431,9 +600,11 @@ curl -s https://api.trakt.tv/users/me \
 
 ## Security Best Practices
 
-- Credentials are stored in macOS Keychain — never in plain files or config
-- Rotate your access token if it is accidentally exposed — run `npm run setup` again
-- Trakt access tokens expire after 90 days — re-run `npm run setup` to refresh
+- Local stdio credentials are stored in macOS Keychain by default; Docker deployments use a mounted token file when `MCP_TRAKT_AUTH_STORE=file`.
+- Keep `.env` and token files private, and never commit secrets.
+- Use HTTPS and `MCP_HTTP_AUTH_TOKEN` or an OAuth/OIDC reverse proxy for remote HTTP deployments.
+- Rotate your access token if it is accidentally exposed — run `npm run setup` again.
+- Trakt access tokens expire; the server refreshes them automatically when a refresh token and client secret are available.
 - Treat your access token like a password: full account access with history/checkin write rights
 
 ---
