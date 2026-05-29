@@ -1,13 +1,13 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process"
+import { dirname, join } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { execFileSync } from "child_process"
-import { dirname, join } from "path"
-import { fileURLToPath } from "url"
 import { z } from "zod"
+import { getTraktCredentials } from "./auth.js"
+import { startHttp, startStdio } from "./transports.js"
 
 if (process.argv[2] === "setup") {
-  const { spawnSync } = await import("child_process")
   const setupScript = join(
     dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -19,56 +19,36 @@ if (process.argv[2] === "setup") {
   process.exit(result.status ?? 0)
 }
 
-const KEYCHAIN_SERVICE = "mcp-trakt"
-
-const keychainRead = (account: string): string | null => {
-  try {
-    return (
-      execFileSync(
-        "security",
-        ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-        { stdio: ["pipe", "pipe", "pipe"] },
-      )
-        .toString()
-        .trim() || null
-    )
-  } catch {
-    return null
-  }
-}
-
-const CLIENT_ID = process.env.MCP_TRAKT_CLIENT_ID || keychainRead("client-id")
-const ACCESS_TOKEN =
-  process.env.MCP_TRAKT_ACCESS_TOKEN || keychainRead("access-token")
-
-if (!CLIENT_ID) {
-  console.error(
-    "Missing client ID — set MCP_TRAKT_CLIENT_ID or run: npx @kud/mcp-trakt setup",
-  )
-  process.exit(1)
-}
-
-if (!ACCESS_TOKEN) {
-  console.error(
-    "Missing access token — set MCP_TRAKT_ACCESS_TOKEN or run: npx @kud/mcp-trakt setup",
-  )
-  process.exit(1)
-}
-
 export const API_BASE = "https://api.trakt.tv"
+
+const needsAccessToken = (path: string) =>
+  path.startsWith("/sync") ||
+  path.startsWith("/calendars/my") ||
+  path.startsWith("/checkin") ||
+  path.startsWith("/scrobble") ||
+  path.startsWith("/recommendations")
 
 export const apiFetch = async <T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T | null> => {
   try {
+    const credentials = await getTraktCredentials()
+    if (needsAccessToken(path) && !credentials.accessToken) {
+      console.error(
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN.`,
+      )
+      return null
+    }
     const response = await fetch(`${API_BASE}${path}`, {
       ...options,
       headers: {
         "trakt-api-version": "2",
-        "trakt-api-key": CLIENT_ID!,
+        "trakt-api-key": credentials.clientId,
         "Content-Type": "application/json",
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        ...(credentials.accessToken
+          ? { Authorization: `Bearer ${credentials.accessToken}` }
+          : {}),
         ...options.headers,
       },
     })
@@ -88,12 +68,19 @@ export const apiFetch = async <T>(
 
 const apiDelete = async (path: string): Promise<boolean> => {
   try {
+    const credentials = await getTraktCredentials()
+    if (!credentials.accessToken) {
+      console.error(
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN.`,
+      )
+      return false
+    }
     const response = await fetch(`${API_BASE}${path}`, {
       method: "DELETE",
       headers: {
         "trakt-api-version": "2",
-        "trakt-api-key": CLIENT_ID!,
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "trakt-api-key": credentials.clientId,
+        Authorization: `Bearer ${credentials.accessToken}`,
         "Content-Type": "application/json",
       },
     })
@@ -763,6 +750,7 @@ export const getUserWatching = async ({ username }: { username: string }) => {
 
 // ─── Server ───
 
+export const createMcpServer = () => {
 const server = new McpServer({ name: "trakt", version: "1.0.0" })
 
 // ─── Search ───
@@ -1718,13 +1706,34 @@ server.registerTool(
   getUserWatching,
 )
 
-const main = async () => {
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
-  console.error("mcp-trakt running")
+return server
 }
 
-main().catch((error) => {
-  console.error("Fatal:", error)
-  process.exit(1)
-})
+const main = async () => {
+  const transport = process.env.MCP_TRANSPORT ?? "stdio"
+  if (transport === "stdio") {
+    await startStdio(createMcpServer())
+    return
+  }
+  if (transport === "http") {
+    await startHttp(createMcpServer, {
+      host: process.env.MCP_HTTP_HOST ?? "127.0.0.1",
+      port: Number(process.env.MCP_HTTP_PORT ?? "3000"),
+      path: process.env.MCP_HTTP_PATH ?? "/mcp",
+      authToken: process.env.MCP_HTTP_AUTH_TOKEN,
+    })
+    return
+  }
+  throw new Error(`Unsupported MCP_TRANSPORT: ${transport}`)
+}
+
+const isEntrypoint = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false
+
+if (isEntrypoint) {
+  main().catch((error) => {
+    console.error("Fatal:", error instanceof Error ? error.message : error)
+    process.exit(1)
+  })
+}
