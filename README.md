@@ -99,7 +99,7 @@ Run the setup command in the same container environment that will store tokens:
 docker compose run --rm mcp-trakt npm run setup
 ```
 
-The setup command uses Trakt's device-code OAuth flow by default, prints a verification URL and user code, and writes tokens to `/data/trakt-tokens.json`. If Trakt rejects the device-code request, setup automatically falls back to a standard authorization-code flow: it prints an authorize URL, asks you to paste the returned code, exchanges it for tokens, and writes the same token file. That path is backed by the `mcp-trakt-data` Docker volume. The token file format is:
+The setup command uses Trakt's device-code OAuth flow, prints a verification URL and user code, and writes tokens to `/data/trakt-tokens.json` by default. That path is backed by the `mcp-trakt-data` Docker volume. The token file format is:
 
 ```json
 {
