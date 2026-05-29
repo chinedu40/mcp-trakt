@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 import { execFileSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
@@ -19,11 +20,11 @@ const authStore = process.env.MCP_TRAKT_AUTH_STORE || (isDocker() ? "file" : "ke
 const tokenFile = process.env.MCP_TRAKT_TOKEN_FILE || DEFAULT_TOKEN_FILE
 
 const oauthHeaders = (clientId) => ({
-  Accept: "application/json",
   "Content-Type": "application/json",
-  "User-Agent": USER_AGENT,
+  Accept: "application/json",
   "trakt-api-version": "2",
   "trakt-api-key": clientId,
+  "User-Agent": USER_AGENT,
 })
 
 const sensitiveKeyPattern = /client_secret|access_token|refresh_token/i
@@ -53,19 +54,25 @@ const safeResponseBody = async (response) => {
   try {
     return JSON.stringify(redactSecrets(JSON.parse(body)), null, 2)
   } catch {
-    return redactSecretText(body)
+    return redactSecretText(body).slice(0, 1500)
   }
 }
 
 const throwOAuthError = async (message, response) => {
   const body = await safeResponseBody(response)
-  throw new Error(`${message} (${response.status})\nResponse body: ${body}`)
+  const cfRay = response.headers.get("cf-ray")
+  const extra = cfRay ? `\nCloudflare Ray ID: ${cfRay}` : ""
+  throw new Error(
+    `${message} (${response.status} ${response.statusText})${extra}\nResponse body: ${body}`,
+  )
 }
 
-const isDockerError = (error) => error instanceof Error && error.message.includes("Device code request failed")
+const isDeviceCodeFlowError = (error) =>
+  error instanceof Error && error.message.includes("Device code request failed")
 
 const keychainRead = (account) => {
   if (authStore !== "keychain") return null
+
   try {
     return (
       execFileSync(
@@ -95,6 +102,7 @@ const keychainWrite = (account, value) =>
 
 const readTokenFile = () => {
   if (!existsSync(tokenFile)) return {}
+
   try {
     return JSON.parse(readFileSync(tokenFile, "utf8"))
   } catch (error) {
@@ -104,10 +112,13 @@ const readTokenFile = () => {
 
 const writeTokenFile = (data) => {
   mkdirSync(dirname(tokenFile), { recursive: true })
+
   const temporaryFile = `${tokenFile}.tmp`
+
   writeFileSync(temporaryFile, `${JSON.stringify(data, null, 2)}\n`, {
     mode: 0o600,
   })
+
   renameSync(temporaryFile, tokenFile)
 }
 
@@ -122,6 +133,7 @@ const saveToken = (clientId, clientSecret, token) => {
       refresh_token: token.refresh_token,
       expires_at: expiresAt,
     })
+
     console.log(`\nSaved Trakt credentials to ${tokenFile}`)
     return
   }
@@ -130,15 +142,21 @@ const saveToken = (clientId, clientSecret, token) => {
   keychainWrite("client-secret", clientSecret)
   keychainWrite("access-token", token.access_token)
   keychainWrite("refresh-token", token.refresh_token)
-  if (expiresAt) keychainWrite("expires-at", String(expiresAt))
+
+  if (expiresAt) {
+    keychainWrite("expires-at", String(expiresAt))
+  }
+
   console.log("\nSaved Trakt credentials to macOS Keychain")
 }
 
 const poll = async (deviceCode, clientId, clientSecret, interval) => {
   process.stdout.write("\nWaiting for authorization")
+
   while (true) {
-    await new Promise((r) => setTimeout(r, interval * 1000))
+    await new Promise((resolve) => setTimeout(resolve, interval * 1000))
     process.stdout.write(".")
+
     const res = await fetch(`${API_BASE}/oauth/device/token`, {
       method: "POST",
       headers: oauthHeaders(clientId),
@@ -148,19 +166,37 @@ const poll = async (deviceCode, clientId, clientSecret, interval) => {
         client_secret: clientSecret,
       }),
     })
+
     if (res.status === 200) {
       process.stdout.write("\n")
       return await res.json()
     }
-    if (res.status === 400) continue
-    if (res.status === 404) throw new Error("Invalid device code")
-    if (res.status === 409) throw new Error("Code already used")
-    if (res.status === 410) throw new Error("Code expired — run setup again")
-    if (res.status === 418) throw new Error("Denied by user")
-    if (res.status === 429) {
-      await new Promise((r) => setTimeout(r, 1000))
+
+    if (res.status === 400) {
       continue
     }
+
+    if (res.status === 404) {
+      throw new Error("Invalid device code")
+    }
+
+    if (res.status === 409) {
+      throw new Error("Code already used")
+    }
+
+    if (res.status === 410) {
+      throw new Error("Code expired, run setup again")
+    }
+
+    if (res.status === 418) {
+      throw new Error("Denied by user")
+    }
+
+    if (res.status === 429) {
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      continue
+    }
+
     await throwOAuthError("Device token request failed", res)
   }
 }
@@ -171,19 +207,18 @@ const runDeviceCodeFlow = async (clientId, clientSecret) => {
     headers: oauthHeaders(clientId),
     body: JSON.stringify({ client_id: clientId }),
   })
-  if (!codeRes.ok) await throwOAuthError("Device code request failed", codeRes)
+
+  if (!codeRes.ok) {
+    await throwOAuthError("Device code request failed", codeRes)
+  }
+
   const code = await codeRes.json()
 
   console.log("\nOpen this URL and enter the code:")
   console.log(code.verification_url)
   console.log(`Code: ${code.user_code}\n`)
 
-  return await poll(
-    code.device_code,
-    clientId,
-    clientSecret,
-    code.interval || 5,
-  )
+  return await poll(code.device_code, clientId, clientSecret, code.interval || 5)
 }
 
 const runAuthorizationCodeFlow = async (clientId, clientSecret) => {
@@ -198,7 +233,10 @@ const runAuthorizationCodeFlow = async (clientId, clientSecret) => {
   console.log("\nAfter approval, paste the returned authorization code below.")
 
   const code = (await ask("Authorization code: ")).trim()
-  if (!code) throw new Error("Authorization code is required.")
+
+  if (!code) {
+    throw new Error("Authorization code is required.")
+  }
 
   const res = await fetch(`${API_BASE}/oauth/token`, {
     method: "POST",
@@ -212,54 +250,73 @@ const runAuthorizationCodeFlow = async (clientId, clientSecret) => {
     }),
   })
 
-  if (!res.ok) await throwOAuthError("Authorization code token exchange failed", res)
+  if (!res.ok) {
+    await throwOAuthError("Authorization code token exchange failed", res)
+  }
+
   return await res.json()
 }
 
-const existingFile = authStore === "file" ? readTokenFile() : {}
-const existingClientId =
-  process.env.MCP_TRAKT_CLIENT_ID || existingFile.client_id || keychainRead("client-id")
-const existingClientSecret =
-  process.env.MCP_TRAKT_CLIENT_SECRET ||
-  existingFile.client_secret ||
-  keychainRead("client-secret")
+const main = async () => {
+  const existingFile = authStore === "file" ? readTokenFile() : {}
 
-console.log("Trakt MCP Setup")
-console.log("───────────────")
-console.log(
-  "Create an app at https://trakt.tv/oauth/applications/new if you haven't yet.\n",
-)
-console.log(`Credential store: ${authStore}`)
-if (authStore === "file") console.log(`Token file: ${tokenFile}`)
-console.log("")
+  const existingClientId =
+    process.env.MCP_TRAKT_CLIENT_ID ||
+    existingFile.client_id ||
+    keychainRead("client-id")
 
-const clientId =
-  (
-    await ask(
-      `Client ID${existingClientId ? ` [${existingClientId.slice(0, 8)}…]` : ""}: `,
-    )
-  ).trim() || existingClientId
-const clientSecret =
-  (await ask(`Client Secret${existingClientSecret ? " [saved]" : ""}: `)).trim() ||
-  existingClientSecret
+  const existingClientSecret =
+    process.env.MCP_TRAKT_CLIENT_SECRET ||
+    existingFile.client_secret ||
+    keychainRead("client-secret")
 
-if (!clientId || !clientSecret) {
-  console.error("Both client ID and secret are required.")
-  process.exit(1)
-}
+  console.log("Trakt MCP Setup")
+  console.log("───────────────")
+  console.log("Create an app at https://trakt.tv/oauth/applications/new if you haven't yet.\n")
+  console.log(`Credential store: ${authStore}`)
 
-try {
+  if (authStore === "file") {
+    console.log(`Token file: ${tokenFile}`)
+  }
+
+  console.log("")
+
+  const clientId =
+    (
+      await ask(
+        `Client ID${existingClientId ? ` [${existingClientId.slice(0, 8)}…]` : ""}: `,
+      )
+    ).trim() || existingClientId
+
+  const clientSecret =
+    (await ask(`Client Secret${existingClientSecret ? " [saved]" : ""}: `)).trim() ||
+    existingClientSecret
+
+  if (!clientId || !clientSecret) {
+    console.error("Both client ID and secret are required.")
+    process.exit(1)
+  }
+
   let token
+
   try {
     token = await runDeviceCodeFlow(clientId, clientSecret)
   } catch (error) {
-    if (!isDockerError(error)) throw error
+    if (!isDeviceCodeFlowError(error)) {
+      throw error
+    }
+
     console.error(`\n${error.message}`)
     token = await runAuthorizationCodeFlow(clientId, clientSecret)
   }
 
   saveToken(clientId, clientSecret, token)
-  console.log("Done. You can now run mcp-trakt.")
+  console.log("Done.")
+  console.log("You can now run mcp-trakt.")
+}
+
+try {
+  await main()
 } catch (error) {
   console.error("\nSetup failed:", error.message)
   process.exit(1)
