@@ -1,8 +1,8 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { createServer, type ServerResponse } from "node:http"
+import { randomUUID } from "node:crypto"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
-import { randomUUID } from "node:crypto"
 
 export type HttpConfig = {
   host: string
@@ -17,20 +17,21 @@ export const startStdio = async (server: McpServer) => {
   console.error("mcp-trakt running on stdio")
 }
 
-const unauthorized = (res: ServerResponse) => {
-  res.writeHead(401, { "Content-Type": "application/json" })
-  res.end(JSON.stringify({ error: "Unauthorized" }))
+const jsonRpcError = (res: ServerResponse, status: number, code: number, message: string) => {
+  res.writeHead(status, { "Content-Type": "application/json" })
+  res.end(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code, message },
+      id: null,
+    }),
+  )
 }
 
-const parseBody = async (req: IncomingMessage) => {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(Buffer.from(chunk))
-  if (chunks.length === 0) return undefined
-  const raw = Buffer.concat(chunks).toString("utf8")
-  return raw ? JSON.parse(raw) : undefined
-}
-
-export const startHttp = async (createMcpServer: () => McpServer, config: HttpConfig) => {
+export const startHttp = async (
+  createMcpServer: () => McpServer,
+  config: HttpConfig,
+) => {
   const transports = new Map<string, StreamableHTTPServerTransport>()
 
   const requireAuth = (authorization: string | undefined) => {
@@ -40,36 +41,43 @@ export const startHttp = async (createMcpServer: () => McpServer, config: HttpCo
 
   const httpServer = createServer(async (req, res) => {
     try {
-      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
+      const url = new URL(
+        req.url || "/",
+        `http://${req.headers.host || "localhost"}`,
+      )
 
       if (url.pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" })
-        res.end(JSON.stringify({ ok: true, service: "mcp-trakt", transport: "http" }))
+        res.end(
+          JSON.stringify({ ok: true, service: "mcp-trakt", transport: "http" }),
+        )
         return
       }
 
       if (url.pathname !== config.path) {
-        res.writeHead(404, { "Content-Type": "application/json" })
-        res.end(JSON.stringify({ error: "Not found" }))
+        jsonRpcError(res, 404, -32001, "Not found")
         return
       }
 
       if (!requireAuth(req.headers.authorization)) {
-        unauthorized(res)
+        jsonRpcError(res, 401, -32001, "Unauthorized")
         return
-      }
-
-      if (!config.authToken && ["0.0.0.0", "::"].includes(config.host)) {
-        // Startup warning is emitted below; keep request path silent to avoid noisy logs.
       }
 
       let transport: StreamableHTTPServerTransport
       const sessionId = req.headers["mcp-session-id"]
       if (typeof sessionId === "string" && transports.has(sessionId)) {
         transport = transports.get(sessionId)!
+      } else if (typeof sessionId === "string") {
+        jsonRpcError(res, 404, -32001, "Session not found")
+        return
       } else {
         transport = new StreamableHTTPServerTransport({
+          enableJsonResponse: true,
           sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (initializedSessionId) => {
+            transports.set(initializedSessionId, transport)
+          },
         })
         transport.onclose = () => {
           if (transport.sessionId) transports.delete(transport.sessionId)
@@ -78,21 +86,27 @@ export const startHttp = async (createMcpServer: () => McpServer, config: HttpCo
         await server.connect(transport)
       }
 
-      const body = req.method === "POST" ? await parseBody(req) : undefined
-      await transport.handleRequest(req, res, body)
-      if (transport.sessionId) transports.set(transport.sessionId, transport)
+      await transport.handleRequest(req, res)
     } catch (error) {
       console.error("HTTP transport error:", (error as Error).message)
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" })
+        jsonRpcError(res, 500, -32603, "Internal server error")
+        return
       }
-      res.end(JSON.stringify({ error: "Internal server error" }))
+      res.end()
     }
   })
 
-  await new Promise<void>((resolve) => httpServer.listen(config.port, config.host, resolve))
+  await new Promise<void>((resolve) =>
+    httpServer.listen(config.port, config.host, resolve),
+  )
   if (!config.authToken && ["0.0.0.0", "::"].includes(config.host)) {
-    console.error("Warning: MCP_HTTP_AUTH_TOKEN is not set while binding to all interfaces. Use HTTPS and a reverse proxy/auth gateway for remote deployment.")
+    console.error(
+      "Warning: MCP_HTTP_AUTH_TOKEN is not set while binding to all interfaces. Use HTTPS and a reverse proxy/auth gateway for remote deployment.",
+    )
   }
-  console.error(`mcp-trakt HTTP MCP server listening on http://${config.host}:${config.port}${config.path}`)
+  console.error(
+    `mcp-trakt HTTP MCP server listening on http://${config.host}:${config.port}${config.path}`,
+  )
+  return httpServer
 }
