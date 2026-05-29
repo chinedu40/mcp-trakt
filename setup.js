@@ -14,6 +14,63 @@ const USER_AGENT = "mcp-trakt-setup/1.0"
 
 const rl = createInterface({ input: process.stdin, output: process.stdout })
 const ask = (q) => new Promise((resolve) => rl.question(q, resolve))
+const envValue = (...names) =>
+  names.map((name) => process.env[name]).find((value) => value && value.length > 0)
+
+const isDocker = () => existsSync("/.dockerenv") || process.env.MCP_TRAKT_AUTH_STORE === "file"
+const authStore = process.env.MCP_TRAKT_AUTH_STORE || (isDocker() ? "file" : "keychain")
+const tokenFile = process.env.MCP_TRAKT_TOKEN_FILE || DEFAULT_TOKEN_FILE
+
+const oauthHeaders = (clientId) => ({
+  "Content-Type": "application/json",
+  Accept: "application/json",
+  "trakt-api-version": "2",
+  "trakt-api-key": clientId,
+  "User-Agent": USER_AGENT,
+})
+
+const sensitiveKeyPattern = /client_secret|access_token|refresh_token/i
+
+const redactSecrets = (value) => {
+  if (Array.isArray(value)) return value.map(redactSecrets)
+  if (!value || typeof value !== "object") return value
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      sensitiveKeyPattern.test(key) ? "[redacted]" : redactSecrets(entry),
+    ]),
+  )
+}
+
+const redactSecretText = (body) =>
+  body.replace(
+    /(client_secret|access_token|refresh_token)(["'\s:=]+)([^\s,"'}]+)/gi,
+    "$1$2[redacted]",
+  )
+
+const safeResponseBody = async (response) => {
+  const body = await response.text()
+  if (!body) return "<empty>"
+
+  try {
+    return JSON.stringify(redactSecrets(JSON.parse(body)), null, 2)
+  } catch {
+    return redactSecretText(body).slice(0, 1500)
+  }
+}
+
+const throwOAuthError = async (message, response) => {
+  const body = await safeResponseBody(response)
+  const cfRay = response.headers.get("cf-ray")
+  const extra = cfRay ? `\nCloudflare Ray ID: ${cfRay}` : ""
+  throw new Error(
+    `${message} (${response.status} ${response.statusText})${extra}\nResponse body: ${body}`,
+  )
+}
+
+const isDeviceCodeFlowError = (error) =>
+  error instanceof Error && error.message.includes("Device code request failed")
 
 const isDocker = () => existsSync("/.dockerenv") || process.env.MCP_TRAKT_AUTH_STORE === "file"
 const authStore = process.env.MCP_TRAKT_AUTH_STORE || (isDocker() ? "file" : "keychain")
@@ -261,12 +318,12 @@ const main = async () => {
   const existingFile = authStore === "file" ? readTokenFile() : {}
 
   const existingClientId =
-    process.env.MCP_TRAKT_CLIENT_ID ||
+    envValue("MCP_TRAKT_CLIENT_ID", "TRAKT_CLIENT_ID") ||
     existingFile.client_id ||
     keychainRead("client-id")
 
   const existingClientSecret =
-    process.env.MCP_TRAKT_CLIENT_SECRET ||
+    envValue("MCP_TRAKT_CLIENT_SECRET", "TRAKT_CLIENT_SECRET") ||
     existingFile.client_secret ||
     keychainRead("client-secret")
 

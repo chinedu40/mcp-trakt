@@ -138,6 +138,8 @@ Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>
 
 The health endpoint intentionally does not expose token values or detailed auth status.
 
+To debug Trakt API failures, set `MCP_TRAKT_DEBUG=1` and restart the service. Request logs include method, URL, redacted request headers, and safe auth-state booleans; failed responses include status, response headers, and the first 2 KB of the response body without logging bearer tokens or client secrets. The server also accepts `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, `TRAKT_ACCESS_TOKEN`, `TRAKT_REFRESH_TOKEN`, and `TRAKT_TOKEN_EXPIRES_AT` as aliases for the `MCP_TRAKT_*` variables.
+
 ### 4. Reverse proxy and HTTPS
 
 For production, put the container behind a reverse proxy, terminate HTTPS there, and bind the Compose port only where appropriate for your host firewall. Do not expose the raw HTTP endpoint to the public internet without either `MCP_HTTP_AUTH_TOKEN` or an OAuth/OIDC-capable gateway.

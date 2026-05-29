@@ -24,6 +24,11 @@ type TokenFile = {
 
 let cachedCredentials: TraktCredentials | null = null
 
+const envValue = (...names: string[]) =>
+  names.map((name) => process.env[name]).find((value) => value && value.length > 0)
+
+const isDebug = () => ["1", "true", "yes"].includes((envValue("MCP_TRAKT_DEBUG", "TRAKT_DEBUG") || "").toLowerCase())
+
 const isDocker = () => existsSync("/.dockerenv") || process.env.MCP_TRAKT_AUTH_STORE === "file"
 
 const keychainRead = (account: string): string | null => {
@@ -100,39 +105,44 @@ const writeTokenFile = (credentials: TraktCredentials) => {
 const loadCredentials = (): TraktCredentials => {
   if (process.env.VITEST) {
     return {
-      clientId: process.env.MCP_TRAKT_CLIENT_ID || "test-client-id",
-      clientSecret: process.env.MCP_TRAKT_CLIENT_SECRET,
-      accessToken: process.env.MCP_TRAKT_ACCESS_TOKEN || "test-access-token",
-      refreshToken: process.env.MCP_TRAKT_REFRESH_TOKEN,
-      expiresAt: parseExpiresAt(process.env.MCP_TRAKT_TOKEN_EXPIRES_AT),
+      clientId: envValue("MCP_TRAKT_CLIENT_ID", "TRAKT_CLIENT_ID") || "test-client-id",
+      clientSecret: envValue("MCP_TRAKT_CLIENT_SECRET", "TRAKT_CLIENT_SECRET"),
+      accessToken: envValue("MCP_TRAKT_ACCESS_TOKEN", "TRAKT_ACCESS_TOKEN") || "test-access-token",
+      refreshToken: envValue("MCP_TRAKT_REFRESH_TOKEN", "TRAKT_REFRESH_TOKEN"),
+      expiresAt: parseExpiresAt(envValue("MCP_TRAKT_TOKEN_EXPIRES_AT", "TRAKT_TOKEN_EXPIRES_AT")),
     }
   }
 
   const file = readTokenFile()
   const clientId =
-    process.env.MCP_TRAKT_CLIENT_ID || file.client_id || keychainRead("client-id")
+    envValue("MCP_TRAKT_CLIENT_ID", "TRAKT_CLIENT_ID") ||
+    file.client_id ||
+    keychainRead("client-id")
   const clientSecret =
-    process.env.MCP_TRAKT_CLIENT_SECRET ||
+    envValue("MCP_TRAKT_CLIENT_SECRET", "TRAKT_CLIENT_SECRET") ||
     file.client_secret ||
     keychainRead("client-secret") ||
     undefined
   const accessToken =
-    process.env.MCP_TRAKT_ACCESS_TOKEN ||
+    envValue("MCP_TRAKT_ACCESS_TOKEN", "TRAKT_ACCESS_TOKEN") ||
     file.access_token ||
     keychainRead("access-token") ||
     undefined
   const refreshToken =
-    process.env.MCP_TRAKT_REFRESH_TOKEN ||
+    envValue("MCP_TRAKT_REFRESH_TOKEN", "TRAKT_REFRESH_TOKEN") ||
     file.refresh_token ||
     keychainRead("refresh-token") ||
     undefined
   const expiresAt = parseExpiresAt(
-    process.env.MCP_TRAKT_TOKEN_EXPIRES_AT || file.expires_at || keychainRead("expires-at") || undefined,
+    envValue("MCP_TRAKT_TOKEN_EXPIRES_AT", "TRAKT_TOKEN_EXPIRES_AT") ||
+      file.expires_at ||
+      keychainRead("expires-at") ||
+      undefined,
   )
 
   if (!clientId) {
     throw new Error(
-      "Missing Trakt client ID. Set MCP_TRAKT_CLIENT_ID, provide it in MCP_TRAKT_TOKEN_FILE, or run npm run setup.",
+      "Missing Trakt client ID. Set MCP_TRAKT_CLIENT_ID (or TRAKT_CLIENT_ID), provide it in MCP_TRAKT_TOKEN_FILE, or run npm run setup.",
     )
   }
 
@@ -148,6 +158,10 @@ const isExpired = (credentials: TraktCredentials) => {
 const refreshCredentials = async (credentials: TraktCredentials) => {
   if (!credentials.clientSecret || !credentials.refreshToken) return credentials
 
+  if (isDebug()) {
+    console.error("Trakt token refresh: attempting refresh with client ID and refresh token present")
+  }
+
   const response = await fetch(`${API_BASE}/oauth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -161,6 +175,10 @@ const refreshCredentials = async (credentials: TraktCredentials) => {
   })
 
   if (!response.ok) {
+    const body = await response.text().catch(() => "<unavailable>")
+    console.error(
+      `Trakt token refresh failed: ${response.status} ${response.statusText} — ${body.slice(0, 1500)}`,
+    )
     throw new Error(
       `Trakt token refresh failed (${response.status}). Re-run npm run setup to authorize again.`,
     )
@@ -181,9 +199,9 @@ const refreshCredentials = async (credentials: TraktCredentials) => {
   return refreshed
 }
 
-export const getTraktCredentials = async () => {
+export const getTraktCredentials = async (options: { requireAccessToken?: boolean } = {}) => {
   cachedCredentials ??= loadCredentials()
-  if (isExpired(cachedCredentials) && cachedCredentials.refreshToken) {
+  if (options.requireAccessToken && isExpired(cachedCredentials) && cachedCredentials.refreshToken) {
     cachedCredentials = await refreshCredentials(cachedCredentials)
   }
   return cachedCredentials

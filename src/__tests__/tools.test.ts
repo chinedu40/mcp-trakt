@@ -76,6 +76,17 @@ describe("getTrendingMovies", () => {
     const result = await api.getTrendingMovies({ limit: 10 })
     expect(result.content[0].text).toContain("Error:")
   })
+
+  it("does not send bearer auth to public endpoints", async () => {
+    mockFetch.mockReturnValue(
+      jsonResponse([{ watchers: 100, movie: { title: "Dune" } }]),
+    )
+    await api.getTrendingMovies({ limit: 10 })
+    const [, request] = mockFetch.mock.calls.at(-1)!
+    const headers = new Headers(request.headers)
+    expect(headers.get("authorization")).toBeNull()
+    expect(headers.get("trakt-api-key")).toBe("test-client-id")
+  })
 })
 
 describe("getAnticipatedMovies", () => {

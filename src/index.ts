@@ -26,52 +26,171 @@ const needsAccessToken = (path: string) =>
   path.startsWith("/calendars/my") ||
   path.startsWith("/checkin") ||
   path.startsWith("/scrobble") ||
+  path.startsWith("/recommendations") ||
+  /^\/users\/me(?:[/?]|$)/.test(path)
+
+const isTraktDebugEnabled = () =>
+  ["1", "true", "yes"].includes(
+    (process.env.MCP_TRAKT_DEBUG || process.env.TRAKT_DEBUG || "").toLowerCase(),
+  )
+
+const redactHeaderValue = (name: string, value: string) => {
+  if (["authorization", "trakt-api-key"].includes(name.toLowerCase())) {
+    return value ? "[redacted]" : "[missing]"
+  }
+  return value
+}
+
+const headersToObject = (headers: Headers) =>
+  Object.fromEntries(
+    [...headers.entries()].map(([name, value]) => [
+      name,
+      redactHeaderValue(name, value),
+    ]),
+  )
+
+const responseHeadersToObject = (headers: Headers) =>
+  Object.fromEntries([...headers.entries()].slice(0, 100))
+
+const previewBody = (body: string) => body.slice(0, 2_000)
+
+const readResponseBody = async (response: Response) => {
+  const maybeText = response as Response & { text?: () => Promise<string> }
+  if (typeof maybeText.text === "function") return await maybeText.text()
+
+  const maybeJson = response as Response & { json?: () => Promise<unknown> }
+  if (typeof maybeJson.json === "function") {
+    return JSON.stringify(await maybeJson.json())
+  }
+
+  return ""
+}
+
+const needsAccessToken = (path: string) =>
+  path.startsWith("/sync") ||
+  path.startsWith("/calendars/my") ||
+  path.startsWith("/checkin") ||
+  path.startsWith("/scrobble") ||
   path.startsWith("/recommendations")
 
 export const apiFetch = async <T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T | null> => {
+  const requiresAccessToken = needsAccessToken(path)
+  const method = options.method || "GET"
+  const url = `${API_BASE}${path}`
+
   try {
-    const credentials = await getTraktCredentials()
-    if (needsAccessToken(path) && !credentials.accessToken) {
+    const credentials = await getTraktCredentials({
+      requireAccessToken: requiresAccessToken,
+    })
+    if (requiresAccessToken && !credentials.accessToken) {
       console.error(
-        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN.`,
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN (or TRAKT_ACCESS_TOKEN).`,
       )
       return null
     }
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers: {
-        "trakt-api-version": "2",
-        "trakt-api-key": credentials.clientId,
-        "Content-Type": "application/json",
-        ...(credentials.accessToken
-          ? { Authorization: `Bearer ${credentials.accessToken}` }
-          : {}),
-        ...options.headers,
-      },
-    })
-    if (!response.ok) {
+
+    const headers = new Headers(options.headers)
+    headers.set("trakt-api-version", "2")
+    headers.set("trakt-api-key", credentials.clientId)
+    headers.set("Content-Type", "application/json")
+    if (requiresAccessToken && credentials.accessToken) {
+      headers.set("Authorization", `Bearer ${credentials.accessToken}`)
+    }
+
+    if (isTraktDebugEnabled()) {
       console.error(
-        `API error: ${response.status} ${response.statusText} — ${path}`,
+        "Trakt API request:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            headers: headersToObject(headers),
+            timeout: "node-fetch-default",
+            requiresAccessToken,
+            hasAccessToken: Boolean(credentials.accessToken),
+          },
+          null,
+          2,
+        ),
+      )
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      method,
+      headers,
+    })
+
+    if (!response.ok) {
+      const body = await readResponseBody(response).catch(() => "<unavailable>")
+      console.error(
+        "Trakt API error:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            status: response.status,
+            statusText: response.statusText,
+            requestHeaders: headersToObject(headers),
+            responseHeaders: responseHeadersToObject(response.headers),
+            body: previewBody(body),
+          },
+          null,
+          2,
+        ),
       )
       return null
     }
     if (response.status === 204) return null
-    return (await response.json()) as T
+
+    const body = await readResponseBody(response)
+    try {
+      return JSON.parse(body) as T
+    } catch (error) {
+      console.error(
+        "Trakt API JSON parse error:",
+        JSON.stringify(
+          {
+            method,
+            url,
+            status: response.status,
+            statusText: response.statusText,
+            responseHeaders: responseHeadersToObject(response.headers),
+            body: previewBody(body),
+            error: error instanceof Error ? error.message : String(error),
+          },
+          null,
+          2,
+        ),
+      )
+      return null
+    }
   } catch (error) {
-    console.error(`Fetch failed: ${path}`, error)
+    console.error(
+      "Trakt API fetch failed:",
+      JSON.stringify(
+        {
+          method,
+          url,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        null,
+        2,
+      ),
+    )
     return null
   }
 }
 
 const apiDelete = async (path: string): Promise<boolean> => {
   try {
-    const credentials = await getTraktCredentials()
+    const credentials = await getTraktCredentials({ requireAccessToken: true })
     if (!credentials.accessToken) {
       console.error(
-        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN.`,
+        `Auth required for ${path}. Run npm run setup or provide MCP_TRAKT_ACCESS_TOKEN (or TRAKT_ACCESS_TOKEN).`,
       )
       return false
     }
@@ -84,6 +203,12 @@ const apiDelete = async (path: string): Promise<boolean> => {
         "Content-Type": "application/json",
       },
     })
+    if (!response.ok) {
+      const body = await readResponseBody(response).catch(() => "<unavailable>")
+      console.error(
+        `Trakt API DELETE error: ${response.status} ${response.statusText} — ${path} — ${previewBody(body)}`,
+      )
+    }
     return response.ok
   } catch (error) {
     console.error(`Delete failed: ${path}`, error)
